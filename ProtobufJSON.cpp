@@ -106,8 +106,19 @@ void Serializer::WriteSimpleMessageField(google::protobuf::Message const& value,
             WriteEnum(reflection->GetEnum(value, field));
             break;
         case google::protobuf::FieldDescriptor::CPPTYPE_STRING:
-            WriteString(reflection->GetString(value, field));
+        {
+            std::string strValue = reflection->GetString(value, field);
+            if (field->type() == google::protobuf::FieldDescriptor::TYPE_STRING)
+                WriteString(strValue);
+            else
+            {
+                _writer.StartArray();
+                for (std::size_t i = 0; i < strValue.length(); ++i)
+                    WriteUInt32(uint32(strValue[i]));
+                _writer.EndArray();
+            }
             break;
+        }
         case google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE:
             WriteMessage(reflection->GetMessage(value, field));
             break;
@@ -148,8 +159,19 @@ void Serializer::WriteRepeatedMessageField(google::protobuf::Message const& valu
                 WriteEnum(reflection->GetRepeatedEnum(value, field, i));
                 break;
             case google::protobuf::FieldDescriptor::CPPTYPE_STRING:
-                WriteString(reflection->GetRepeatedString(value, field, i));
+            {
+                std::string strValue = reflection->GetRepeatedString(value, field, i);
+                if (field->type() == google::protobuf::FieldDescriptor::TYPE_STRING)
+                    WriteString(strValue);
+                else
+                {
+                    _writer.StartArray();
+                    for (std::size_t j = 0; j < strValue.length(); ++j)
+                        WriteUInt32(uint32(strValue[j]));
+                    _writer.EndArray();
+                }
                 break;
+            }
             case google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE:
                 WriteMessage(reflection->GetRepeatedMessage(value, field, i));
                 break;
@@ -165,6 +187,7 @@ public:
     bool ReadMessage(std::string json, google::protobuf::Message* message);
 
     bool Key(const Ch* str, rapidjson::SizeType length, bool copy);
+    bool Null();
     bool Bool(bool b);
     bool Int(int32 i);
     bool Uint(uint32 i);
@@ -175,6 +198,7 @@ public:
     bool StartObject();
     bool EndObject(rapidjson::SizeType memberCount);
     bool StartArray();
+    bool EndArray(rapidjson::SizeType memberCount);
 
 private:
     bool CheckType(google::protobuf::FieldDescriptor::CppType expectedType);
@@ -193,10 +217,12 @@ bool Deserializer::ReadMessage(std::string json, google::protobuf::Message* mess
 
     rapidjson::ParseResult result = _reader.Parse(ss, *this);
 
+    ASSERT(result.IsError() || (_objectState.empty() && _state.empty()));
+
     return !result.IsError() && _errors.empty();
 }
 
-bool Deserializer::Key(const Ch* str, rapidjson::SizeType length, bool copy)
+bool Deserializer::Key(const Ch* str, rapidjson::SizeType /*length*/, bool /*copy*/)
 {
     google::protobuf::FieldDescriptor const* field = _objectState.top()->GetDescriptor()->FindFieldByName(str);
     if (!field)
@@ -206,6 +232,12 @@ bool Deserializer::Key(const Ch* str, rapidjson::SizeType length, bool copy)
     }
 
     _state.push(field);
+    return true;
+}
+
+bool Deserializer::Null()
+{
+    _state.pop();
     return true;
 }
 
@@ -237,10 +269,30 @@ bool Deserializer::Int(int32 i)
 
 bool Deserializer::Uint(uint32 i)
 {
-    if (!CheckType(google::protobuf::FieldDescriptor::CPPTYPE_UINT32))
-        return false;
+    google::protobuf::FieldDescriptor const* field = _state.top();
+    google::protobuf::Message* message = _objectState.top();
+    switch (field->cpp_type())
+    {
+        case google::protobuf::FieldDescriptor::CPPTYPE_UINT32:
+            SET_FIELD(message, field, UInt32, i);
+            break;
+        case google::protobuf::FieldDescriptor::CPPTYPE_STRING:
+        {
+            if (field->type() != google::protobuf::FieldDescriptor::TYPE_BYTES)
+            {
+                _errors.emplace_back("Expected field type to be bytes but got string instead.");
+                return false;
+            }
+            std::string currentValue = message->GetReflection()->GetString(*message, field);
+            currentValue.append(1, (char)i);
+            message->GetReflection()->SetString(message, field, currentValue);
+            break;
+        }
+        default:
+            _errors.push_back(Trinity::StringFormat("Expected field type to be uint32 or string but got %s instead.", _state.top()->cpp_type_name()));
+            return false;
+    }
 
-    SET_FIELD(_objectState.top(), _state.top(), UInt32, i);
     return true;
 }
 
@@ -282,7 +334,7 @@ bool Deserializer::Double(double d)
     return true;
 }
 
-bool Deserializer::String(const Ch* str, rapidjson::SizeType length, bool copy)
+bool Deserializer::String(const Ch* str, rapidjson::SizeType /*length*/, bool /*copy*/)
 {
     google::protobuf::FieldDescriptor const* field = _state.top();
     google::protobuf::Message* message = _objectState.top();
@@ -334,8 +386,11 @@ bool Deserializer::StartObject()
     return true;
 }
 
-bool Deserializer::EndObject(rapidjson::SizeType memberCount)
+bool Deserializer::EndObject(rapidjson::SizeType /*memberCount*/)
 {
+    if (!_state.empty() && !_state.top()->is_repeated())
+        _state.pop();
+
     _objectState.pop();
     return true;
 }
@@ -348,10 +403,9 @@ bool Deserializer::StartArray()
         return false;
     }
 
-    if (!_state.top()->is_repeated())
+    if (_state.top()->is_repeated() ^ (_state.top()->type() != google::protobuf::FieldDescriptor::TYPE_BYTES))
     {
-        _errors.push_back(Trinity::StringFormat("Expected field %s type to be a single value but got array instead.",
-            _state.top()->full_name().c_str()));
+        _errors.push_back(Trinity::StringFormat("Expected field %s type to be exactly an array OR bytes but it was both or none.", _state.top()->full_name().c_str()));
         return false;
     }
 
@@ -367,6 +421,12 @@ bool Deserializer::CheckType(google::protobuf::FieldDescriptor::CppType expected
         return false;
     }
 
+    return true;
+}
+
+bool Deserializer::EndArray(rapidjson::SizeType /*memberCount*/)
+{
+    _state.pop();
     return true;
 }
 
